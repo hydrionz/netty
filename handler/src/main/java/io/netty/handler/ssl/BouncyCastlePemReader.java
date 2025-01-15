@@ -13,24 +13,12 @@
  * License for the specific language governing permissions and limitations
  * under the License.
  */
-
 package io.netty.handler.ssl;
 
 import io.netty.util.CharsetUtil;
+import io.netty.util.internal.ThrowableUtil;
 import io.netty.util.internal.logging.InternalLogger;
 import io.netty.util.internal.logging.InternalLoggerFactory;
-
-import java.io.File;
-import java.io.FileNotFoundException;
-import java.io.FileReader;
-import java.io.IOException;
-import java.io.InputStream;
-import java.io.InputStreamReader;
-import java.security.AccessController;
-import java.security.PrivateKey;
-import java.security.PrivilegedAction;
-import java.security.Provider;
-
 import org.bouncycastle.asn1.pkcs.PrivateKeyInfo;
 import org.bouncycastle.openssl.PEMDecryptorProvider;
 import org.bouncycastle.openssl.PEMEncryptedKeyPair;
@@ -44,12 +32,26 @@ import org.bouncycastle.operator.OperatorCreationException;
 import org.bouncycastle.pkcs.PKCS8EncryptedPrivateKeyInfo;
 import org.bouncycastle.pkcs.PKCSException;
 
-final class BouncyCastlePemReader {
-    private static Throwable UNAVAILABILITY_CAUSE;
+import java.io.File;
+import java.io.FileNotFoundException;
+import java.io.FileReader;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.security.AccessController;
+import java.security.PrivateKey;
+import java.security.PrivilegedAction;
+import java.security.Provider;
 
+final class BouncyCastlePemReader {
+    private static final String BC_PROVIDER = "org.bouncycastle.jce.provider.BouncyCastleProvider";
+    private static final String BC_FIPS_PROVIDER = "org.bouncycastle.jcajce.provider.BouncyCastleFipsProvider";
+    private static final String BC_PEMPARSER = "org.bouncycastle.openssl.PEMParser";
     private static final InternalLogger logger = InternalLoggerFactory.getInstance(BouncyCastlePemReader.class);
-    private static Provider bcProvider;
-    private static Boolean attemptedLoading = false;
+
+    private static volatile Throwable unavailabilityCause;
+    private static volatile Provider bcProvider;
+    private static volatile boolean attemptedLoading;
 
     public static boolean hasAttemptedLoading() {
         return attemptedLoading;
@@ -59,14 +61,14 @@ final class BouncyCastlePemReader {
         if (!hasAttemptedLoading()) {
             tryLoading();
         }
-        return UNAVAILABILITY_CAUSE == null;
+        return unavailabilityCause == null;
     }
 
     /**
      * @return the cause if unavailable. {@code null} if available.
      */
     public static Throwable unavailabilityCause() {
-        return UNAVAILABILITY_CAUSE;
+        return unavailabilityCause;
     }
 
     private static void tryLoading() {
@@ -74,19 +76,30 @@ final class BouncyCastlePemReader {
             @Override
             public Void run() {
                 try {
-                    Class<Provider> bcProviderClass
-                      = (Class<Provider>) Class.forName("org.bouncycastle.jce.provider.BouncyCastleProvider",
-                              true, this.getClass().getClassLoader());
+                    ClassLoader classLoader = getClass().getClassLoader();
+                    // Check for bcprov-jdk15on or bc-fips:
+                    Class<Provider> bcProviderClass;
+                    try {
+                        bcProviderClass = (Class<Provider>) Class.forName(BC_PROVIDER, true, classLoader);
+                    } catch (ClassNotFoundException e) {
+                        try {
+                            bcProviderClass = (Class<Provider>) Class.forName(BC_FIPS_PROVIDER, true, classLoader);
+                        } catch (ClassNotFoundException ex) {
+                            ThrowableUtil.addSuppressed(e, ex);
+                            throw e;
+                        }
+                    }
+                    // Check for bcpkix-jdk15on:
+                    Class.forName(BC_PEMPARSER, true, classLoader);
                     bcProvider = bcProviderClass.getConstructor().newInstance();
                     logger.debug("Bouncy Castle provider available");
                     attemptedLoading = true;
                 } catch (Throwable e) {
                     logger.debug("Cannot load Bouncy Castle provider", e);
-                    UNAVAILABILITY_CAUSE = e;
+                    unavailabilityCause = e;
                     attemptedLoading = true;
-                } finally {
-                    return null;
                 }
+                return null;
             }
         });
     }
@@ -146,38 +159,48 @@ final class BouncyCastlePemReader {
     private static PrivateKey getPrivateKey(PEMParser pemParser, String keyPassword) throws IOException,
             PKCSException, OperatorCreationException {
         try {
-            Object object = pemParser.readObject();
-            if (logger.isDebugEnabled()) {
-                logger.debug("Parsed PEM object of type {} and assume " +
-                        "key is {}encrypted", object.getClass().getName(), keyPassword == null ? "not " : "");
-            }
             JcaPEMKeyConverter converter = newConverter();
             PrivateKey pk = null;
 
-            if (keyPassword == null) {
-                // assume private key is not encrypted
-                if (object instanceof PrivateKeyInfo) {
-                    pk = converter.getPrivateKey((PrivateKeyInfo) object);
-                } else if (object instanceof PEMKeyPair) {
-                    pk = converter.getKeyPair((PEMKeyPair) object).getPrivate();
-                } else {
-                    logger.debug("Unable to handle PEM object of type {} as a non encrypted key", object.getClass());
+            Object object = pemParser.readObject();
+            while (object != null && pk == null) {
+                if (logger.isDebugEnabled()) {
+                    logger.debug("Parsed PEM object of type {} and assume " +
+                                 "key is {}encrypted", object.getClass().getName(), keyPassword == null? "not " : "");
                 }
-            } else {
-                // assume private key is encrypted
-                if (object instanceof PEMEncryptedKeyPair) {
-                    PEMDecryptorProvider decProv = new JcePEMDecryptorProviderBuilder()
-                            .setProvider(bcProvider)
-                            .build(keyPassword.toCharArray());
-                    pk = converter.getKeyPair(((PEMEncryptedKeyPair) object).decryptKeyPair(decProv)).getPrivate();
-                } else if (object instanceof PKCS8EncryptedPrivateKeyInfo) {
-                    InputDecryptorProvider pkcs8InputDecryptorProvider = new JceOpenSSLPKCS8DecryptorProviderBuilder()
-                            .setProvider(bcProvider)
-                            .build(keyPassword.toCharArray());
-                    pk = converter.getPrivateKey(((PKCS8EncryptedPrivateKeyInfo) object)
-                            .decryptPrivateKeyInfo(pkcs8InputDecryptorProvider));
+
+                if (keyPassword == null) {
+                    // assume private key is not encrypted
+                    if (object instanceof PrivateKeyInfo) {
+                        pk = converter.getPrivateKey((PrivateKeyInfo) object);
+                    } else if (object instanceof PEMKeyPair) {
+                        pk = converter.getKeyPair((PEMKeyPair) object).getPrivate();
+                    } else {
+                        logger.debug("Unable to handle PEM object of type {} as a non encrypted key",
+                                     object.getClass());
+                    }
                 } else {
-                    logger.debug("Unable to handle PEM object of type {} as a encrypted key", object.getClass());
+                    // assume private key is encrypted
+                    if (object instanceof PEMEncryptedKeyPair) {
+                        PEMDecryptorProvider decProv = new JcePEMDecryptorProviderBuilder()
+                                .setProvider(bcProvider)
+                                .build(keyPassword.toCharArray());
+                        pk = converter.getKeyPair(((PEMEncryptedKeyPair) object).decryptKeyPair(decProv)).getPrivate();
+                    } else if (object instanceof PKCS8EncryptedPrivateKeyInfo) {
+                        InputDecryptorProvider pkcs8InputDecryptorProvider =
+                                new JceOpenSSLPKCS8DecryptorProviderBuilder()
+                                        .setProvider(bcProvider)
+                                        .build(keyPassword.toCharArray());
+                        pk = converter.getPrivateKey(((PKCS8EncryptedPrivateKeyInfo) object)
+                                                             .decryptPrivateKeyInfo(pkcs8InputDecryptorProvider));
+                    } else {
+                        logger.debug("Unable to handle PEM object of type {} as a encrypted key", object.getClass());
+                    }
+                }
+
+                // Try reading next entry in the pem file if private key is not yet found
+                if (pk == null) {
+                    object = pemParser.readObject();
                 }
             }
 
@@ -192,8 +215,8 @@ final class BouncyCastlePemReader {
             if (pemParser != null) {
                 try {
                     pemParser.close();
-                } catch (Exception ignore) {
-                    logger.debug("Failed closing pem parser", ignore);
+                } catch (Exception exception) {
+                    logger.debug("Failed closing pem parser", exception);
                 }
             }
         }
