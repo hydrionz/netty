@@ -569,11 +569,7 @@ public final class NioEventLoop extends SingleThreadEventLoop {
                     ranTasks = runAllTasks(0); // This will run the minimum number of tasks
                 }
 
-                if (ranTasks || strategy > 0) {
-                    if (selectCnt > MIN_PREMATURE_SELECTOR_RETURNS && logger.isDebugEnabled()) {
-                        logger.debug("Selector.select() returned prematurely {} times in a row for Selector {}.",
-                                selectCnt - 1, selector);
-                    }
+                if (selectReturnPrematurely(selectCnt, ranTasks, strategy)) {
                     selectCnt = 0;
                 } else if (unexpectedSelectorWakeup(selectCnt)) { // Unexpected wakeup (unusual case)
                     selectCnt = 0;
@@ -604,6 +600,18 @@ public final class NioEventLoop extends SingleThreadEventLoop {
                 }
             }
         }
+    }
+
+    // returns true if selectCnt should be reset
+    private boolean selectReturnPrematurely(int selectCnt, boolean ranTasks, int strategy) {
+        if (ranTasks || strategy > 0) {
+            if (selectCnt > MIN_PREMATURE_SELECTOR_RETURNS && logger.isDebugEnabled()) {
+                logger.debug("Selector.select() returned prematurely {} times in a row for Selector {}.",
+                    selectCnt - 1, selector);
+            }
+            return true;
+        }
+        return false;
     }
 
     // returns true if selectCnt should be reset
@@ -779,7 +787,7 @@ public final class NioEventLoop extends SingleThreadEventLoop {
             // Process OP_WRITE first as we may be able to write some queued buffers and so free memory.
             if ((readyOps & SelectionKey.OP_WRITE) != 0) {
                 // Call forceFlush which will also take care of clear the OP_WRITE once there is nothing left to write
-                ch.unsafe().forceFlush();
+               unsafe.forceFlush();
             }
 
             // Also check for readOps of 0 to workaround possible JDK bug which may otherwise lead
