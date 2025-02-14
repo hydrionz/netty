@@ -19,7 +19,6 @@ import io.netty.util.internal.ObjectUtil;
 import io.netty.util.internal.PlatformDependent;
 import io.netty.util.internal.SystemPropertyUtil;
 import io.netty.util.internal.ThreadExecutorMap;
-import io.netty.util.internal.UnstableApi;
 import io.netty.util.internal.logging.InternalLogger;
 import io.netty.util.internal.logging.InternalLoggerFactory;
 import org.jetbrains.annotations.Async.Schedule;
@@ -270,6 +269,9 @@ public abstract class SingleThreadEventExecutor extends AbstractScheduledEventEx
                 }
 
                 if (task != null) {
+                    if (task == WAKEUP_TASK) {
+                        return null;
+                    }
                     return task;
                 }
             }
@@ -495,7 +497,6 @@ public abstract class SingleThreadEventExecutor extends AbstractScheduledEventEx
     /**
      * Invoked before returning from {@link #runAllTasks()} and {@link #runAllTasks(long)}.
      */
-    @UnstableApi
     protected void afterRunningAllTasks() { }
 
     /**
@@ -516,7 +517,6 @@ public abstract class SingleThreadEventExecutor extends AbstractScheduledEventEx
      * Returns the absolute point in time (relative to {@link #getCurrentTimeNanos()}) at which the next
      * closest scheduled task should run.
      */
-    @UnstableApi
     protected long deadlineNanos() {
         ScheduledFutureTask<?> scheduledTask = peekScheduledTask();
         if (scheduledTask == null) {
@@ -824,7 +824,7 @@ public abstract class SingleThreadEventExecutor extends AbstractScheduledEventEx
 
     private void execute0(@Schedule Runnable task) {
         ObjectUtil.checkNotNull(task, "task");
-        execute(task, !(task instanceof LazyRunnable) && wakesUpForTask(task));
+        execute(task, wakesUpForTask(task));
     }
 
     private void lazyExecute0(@Schedule Runnable task) {
@@ -917,7 +917,7 @@ public abstract class SingleThreadEventExecutor extends AbstractScheduledEventEx
     }
 
     /**
-     * @deprecated use {@link AbstractEventExecutor.LazyRunnable}
+     * @deprecated override {@link SingleThreadEventExecutor#wakesUpForTask} to re-create this behaviour
      */
     @Deprecated
     protected interface NonWakeupRunnable extends LazyRunnable { }
@@ -992,11 +992,13 @@ public abstract class SingleThreadEventExecutor extends AbstractScheduledEventEx
                 }
 
                 boolean success = false;
+                Throwable unexpectedException = null;
                 updateLastExecutionTime();
                 try {
                     SingleThreadEventExecutor.this.run();
                     success = true;
                 } catch (Throwable t) {
+                    unexpectedException = t;
                     logger.warn("Unexpected exception from an event executor: ", t);
                 } finally {
                     for (;;) {
@@ -1056,7 +1058,11 @@ public abstract class SingleThreadEventExecutor extends AbstractScheduledEventEx
                                 logger.warn("An event executor terminated with " +
                                         "non-empty task queue (" + numUserTasks + ')');
                             }
-                            terminationFuture.setSuccess(null);
+                            if (unexpectedException == null) {
+                                terminationFuture.setSuccess(null);
+                            } else {
+                                terminationFuture.setFailure(unexpectedException);
+                            }
                         }
                     }
                 }

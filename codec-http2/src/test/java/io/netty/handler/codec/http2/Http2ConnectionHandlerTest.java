@@ -12,7 +12,6 @@
  * or implied. See the License for the specific language governing permissions and limitations under
  * the License.
  */
-
 package io.netty.handler.codec.http2;
 
 import io.netty.buffer.ByteBuf;
@@ -710,7 +709,7 @@ public class Http2ConnectionHandlerTest {
     @Test
     public void canCloseStreamWithVoidPromise() throws Exception {
         handler = newHandler();
-        handler.closeStream(stream, ctx.voidPromise());
+        handler.closeStream(stream, ctx.voidPromise().setSuccess());
         verify(stream, times(1)).close();
         verifyNoMoreInteractions(stream);
     }
